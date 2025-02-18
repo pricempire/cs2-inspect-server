@@ -131,80 +131,91 @@ export class InspectService implements OnModuleInit {
     }
 
     private async initializeAllBots() {
-        const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '100');
+        const MAX_CONCURRENT_INIT = parseInt(process.env.MAX_CONCURRENT_INIT || '5');
         const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3');
-
         const sessionPath = process.env.SESSION_PATH || './sessions';
+
         if (!fs.existsSync(sessionPath)) {
             fs.mkdirSync(sessionPath, { recursive: true });
             this.logger.debug(`Created session directory at: ${sessionPath}`);
         }
 
-        for (let i = 0; i < this.accounts.length; i += BATCH_SIZE) {
-            const batch = this.accounts.slice(i, i + BATCH_SIZE);
-            const initPromises = batch.map(async (account) => {
-                const [username, password] = account.split(':');
+        const initializationQueue = [...this.accounts];
+        const activeInitializations = new Set();
+        let completedCount = 0;
 
-                // Check if account is throttled
-                const throttleExpiry = this.throttledAccounts.get(username);
-                if (throttleExpiry && Date.now() < throttleExpiry) {
-                    this.logger.warn(`Account ${username} is throttled. Skipping initialization.`);
+        const initializeBot = async (account: string) => {
+            const [username, password] = account.split(':');
+
+            // Check if account is throttled
+            const throttleExpiry = this.throttledAccounts.get(username);
+            if (throttleExpiry && Date.now() < throttleExpiry) {
+                this.logger.warn(`Account ${username} is throttled. Skipping initialization.`);
+                return;
+            }
+
+            let retryCount = 0;
+            while (retryCount < MAX_RETRIES) {
+                try {
+                    const bot = new Bot({
+                        username,
+                        password,
+                        proxyUrl: process.env.PROXY_URL,
+                        debug: process.env.DEBUG === 'true',
+                        sessionPath,
+                        blacklistPath: process.env.BLACKLIST_PATH || './blacklist.txt',
+                        inspectTimeout: 10000,
+                    });
+
+                    bot.on('inspectResult', (response) => this.handleInspectResult(username, response));
+                    bot.on('error', (error) => {
+                        this.logger.error(`Bot ${username} error: ${error}`);
+                    });
+
+                    await bot.initialize();
+                    this.bots.set(username, bot);
+                    this.logger.debug(`Bot ${username} initialized successfully`);
+                    this.throttledAccounts.delete(username);
                     return;
-                }
 
-                let retryCount = 0;
-                let initialized = false;
-
-                while (retryCount < MAX_RETRIES && !initialized) {
-                    try {
-                        const bot = new Bot({
-                            username,
-                            password,
-                            proxyUrl: process.env.PROXY_URL,
-                            debug: process.env.DEBUG === 'true',
-                            sessionPath,
-                            blacklistPath: process.env.BLACKLIST_PATH || './blacklist.txt',
-                            inspectTimeout: 10000,
-                        });
-
-                        bot.on('inspectResult', (response) => this.handleInspectResult(username, response));
-                        bot.on('error', (error) => {
-                            this.logger.error(`Bot ${username} error: ${error}`);
-                        });
-
-                        await bot.initialize();
-                        this.bots.set(username, bot);
-                        this.logger.debug(`Bot ${username} initialized successfully`);
-                        initialized = true;
-                        // Clear throttle status if successful
-                        this.throttledAccounts.delete(username);
-
-                    } catch (error) {
-                        if (error.message === 'ACCOUNT_DISABLED') {
-                            this.logger.error(`Account ${username} is disabled. Blacklisting...`);
-                            this.accounts = this.accounts.filter(acc => !acc.startsWith(username));
-                            break;
-                        } else if (error.message === 'LOGIN_THROTTLED') {
-                            this.logger.warn(`Account ${username} is throttled. Adding to cooldown.`);
-                            this.throttledAccounts.set(username, Date.now() + this.THROTTLE_COOLDOWN);
-                            break;
-                        } else if (error.message === 'INITIALIZATION_ERROR') {
-                            this.logger.warn(`Initialization timeout for bot ${username}. Retrying...`);
-                            if (retryCount >= MAX_RETRIES) {
-                                this.logger.error(`Max retries reached for bot ${username}. Initialization failed.`);
-                            }
-                        } else {
-                            this.logger.error(`Failed to initialize bot ${username}: ${error.message}`);
-                        }
-                        retryCount++;
+                } catch (error) {
+                    if (error.message === 'ACCOUNT_DISABLED') {
+                        this.logger.error(`Account ${username} is disabled. Blacklisting...`);
+                        this.accounts = this.accounts.filter(acc => !acc.startsWith(username));
+                        return;
+                    } else if (error.message === 'LOGIN_THROTTLED') {
+                        this.logger.warn(`Account ${username} is throttled. Adding to cooldown.`);
+                        this.throttledAccounts.set(username, Date.now() + this.THROTTLE_COOLDOWN);
+                        return;
                     }
 
+                    this.logger.warn(`Failed to initialize bot ${username}: ${error.message}. Retry ${retryCount + 1}/${MAX_RETRIES}`);
+                    retryCount++;
                     await new Promise(resolve => setTimeout(resolve, 1000));
                 }
-            });
+            }
+        };
 
-            await Promise.allSettled(initPromises);
-            this.logger.debug(`Initialized batch of ${batch.length} bots (${i + batch.length}/${this.accounts.length} total)`);
+        const processNext = async () => {
+            while (initializationQueue.length > 0 && activeInitializations.size < MAX_CONCURRENT_INIT) {
+                const account = initializationQueue.shift()!;
+                activeInitializations.add(account);
+
+                initializeBot(account).finally(() => {
+                    activeInitializations.delete(account);
+                    completedCount++;
+                    this.logger.debug(`Progress: ${completedCount}/${this.accounts.length} bots initialized`);
+                    processNext(); // Process next account when current one is done
+                });
+            }
+        };
+
+        // Start initial batch of initializations
+        await processNext();
+
+        // Wait for all initializations to complete
+        while (activeInitializations.size > 0 || initializationQueue.length > 0) {
+            await new Promise(resolve => setTimeout(resolve, 100));
         }
 
         this.logger.debug(`Finished initializing ${this.bots.size} bots`);
