@@ -18,6 +18,8 @@ import { InspectDto } from './inspect.dto'
 import { Bot } from './bot.class'
 import { createHash } from 'crypto'
 import { QueueService } from './queue.service'
+
+
 @Injectable()
 export class InspectService implements OnModuleInit {
     private readonly logger = new Logger(InspectService.name)
@@ -49,11 +51,6 @@ export class InspectService implements OnModuleInit {
     private failed = 0
     private timeouts = 0
 
-    private readonly HEALTH_CHECK_THRESHOLD = 30 * 60 * 1000; // 30 minutes
-    private readonly MIN_BOT_RATIO = 0.7; // 70% minimum active bots
-    private lastHealthyTime: number = Date.now();
-    private isRecovering: boolean = false;
-
     constructor(
         private parseService: ParseService,
         private formatService: FormatService,
@@ -73,6 +70,18 @@ export class InspectService implements OnModuleInit {
     private async loadAccounts(): Promise<string[]> {
         let accounts: string[] = []
         const accountsFile = process.env.ACCOUNTS_FILE || 'accounts.txt'
+
+        let blacklistFile = process.env.BLACKLIST_PATH || './blacklist.txt'
+
+
+        let blacklistedAccounts: string[] = []
+
+        if (fs.existsSync(blacklistFile)) {
+            blacklistedAccounts = fs.readFileSync(blacklistFile, 'utf8').split('\n')
+                .map(account => account.split(':')[0])
+                .map(account => account.trim())
+                .filter(account => account.length > 0)
+        }
 
         try {
             if (fs.existsSync(accountsFile)) {
@@ -100,6 +109,10 @@ export class InspectService implements OnModuleInit {
             accounts = accounts
                 .map(account => account.trim())
                 .filter(account => account.length > 0)
+                .filter(account => !blacklistedAccounts.includes(account))
+                .filter(account => !account.startsWith('//'))
+                .filter(account => !account.startsWith('#'))
+                .filter(account => !account.startsWith(';'))
 
             if (accounts.length === 0) {
                 throw new Error('No valid accounts found in accounts file')
@@ -185,6 +198,8 @@ export class InspectService implements OnModuleInit {
                         }
                         retryCount++;
                     }
+
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                 }
             });
 
@@ -400,6 +415,7 @@ export class InspectService implements OnModuleInit {
             }
 
             attempts++
+            await new Promise(resolve => setTimeout(resolve, 10))
         }
 
         // If we get here, return the first available bot
@@ -666,93 +682,6 @@ export class InspectService implements OnModuleInit {
             this.queueService.remove(assetId);
             this.failed++;
             this.logger.warn(`Cleaned up stale request for asset ${assetId}`);
-        }
-    }
-
-    @Cron('*/5 * * * *') // Run every 5 minutes
-    private cleanupThrottledAccounts() {
-        const now = Date.now();
-        for (const [username, expiry] of this.throttledAccounts.entries()) {
-            if (now >= expiry) {
-                this.throttledAccounts.delete(username);
-                this.logger.debug(`Removed ${username} from throttle list`);
-            }
-        }
-    }
-
-    @Cron('*/1 * * * *') // Run every minute
-    private async checkBotsHealth() {
-        const readyBots = Array.from(this.bots.values()).filter(bot => bot.isReady()).length;
-        const busyBots = Array.from(this.bots.values()).filter(bot => bot.isBusy()).length;
-        const cooldownBots = Array.from(this.bots.values()).filter(bot => bot.isCooldown()).length;
-        const errorBots = Array.from(this.bots.values()).filter(bot => bot.isError()).length;
-        const disconnectedBots = Array.from(this.bots.values()).filter(bot => bot.isDisconnected()).length;
-
-        const totalBots = this.bots.size;
-        const expectedBots = this.accounts.length;
-
-        // Consider both ready and temporarily occupied (busy/cooldown) bots as "active"
-        const activeBots = readyBots + busyBots + cooldownBots;
-        const botRatio = activeBots / expectedBots;
-        const isBotRatioLow = botRatio < this.MIN_BOT_RATIO;
-
-        // If we have too many error or disconnected bots
-        const problematicBots = errorBots + disconnectedBots;
-        const isHighErrorRate = (problematicBots / totalBots) > 0.3; // More than 30% problematic
-
-        if ((activeBots === 0 || isBotRatioLow || isHighErrorRate) && totalBots > 0) {
-            const timeSinceHealthy = Date.now() - this.lastHealthyTime;
-
-            this.logger.warn(
-                `Unhealthy bot state!\n` +
-                `Ready: ${readyBots}, Busy: ${busyBots}, Cooldown: ${cooldownBots}\n` +
-                `Error: ${errorBots}, Disconnected: ${disconnectedBots}\n` +
-                `Active ratio: ${(botRatio * 100).toFixed(1)}% (${activeBots}/${expectedBots})\n` +
-                `Last healthy: ${Math.floor(timeSinceHealthy / 1000)}s ago`
-            );
-
-            // Only attempt recovery if:
-            // 1. We've been unhealthy for more than the threshold
-            // 2. We're not already recovering
-            // 3. We have accounts configured
-            // 4. We have actual problems (not just temporary busy/cooldown states)
-            const needsRecovery = (
-                activeBots === 0 ||
-                isHighErrorRate ||
-                (isBotRatioLow && (errorBots > 0 || disconnectedBots > 0))
-            );
-
-            if (timeSinceHealthy > this.HEALTH_CHECK_THRESHOLD && !this.isRecovering && this.accounts.length > 0 && needsRecovery) {
-                await this.recoverBots();
-            }
-        } else if (activeBots > 0 && !isBotRatioLow && !isHighErrorRate) {
-            this.lastHealthyTime = Date.now();
-        }
-    }
-
-    private async recoverBots() {
-        try {
-            this.isRecovering = true;
-            this.logger.warn('Starting bot recovery process...');
-
-            // Destroy all existing bots
-            const destroyPromises = Array.from(this.bots.values()).map(bot => bot.destroy());
-            await Promise.allSettled(destroyPromises);
-
-            // Clear the bots map
-            this.bots.clear();
-
-            // Wait a bit before reinitializing
-            await new Promise(resolve => setTimeout(resolve, 5000));
-
-            // Reinitialize bots
-            await this.initializeAllBots();
-
-            this.logger.log(`Recovery complete. ${this.bots.size} bots reinitialized`);
-        } catch (error) {
-            this.logger.error(`Recovery failed: ${error.message}`);
-        } finally {
-            this.isRecovering = false;
         }
     }
 }
