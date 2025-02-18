@@ -131,7 +131,7 @@ export class InspectService implements OnModuleInit {
     }
 
     private async initializeAllBots() {
-        const MAX_CONCURRENT_INIT = parseInt(process.env.MAX_CONCURRENT_INIT || '5');
+        const MAX_CONCURRENT_INIT = parseInt(process.env.MAX_CONCURRENT_INIT || '25');
         const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3');
         const sessionPath = process.env.SESSION_PATH || './sessions';
 
